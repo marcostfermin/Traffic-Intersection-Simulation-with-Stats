@@ -37,6 +37,33 @@ defaultStop = {'right': 580, 'down': 320, 'left': 810, 'up': 545}
 stoppingGap = 25    # stopping gap
 movingGap = 25   # moving gap
 
+# Enable dynamic traffic density to vary spawn delay and direction bias over time
+dynamicTrafficDensity = True
+# Each entry defines when the configuration becomes active (in seconds),
+# the delay between spawns, and relative weights for each direction.
+trafficDensitySchedule = sorted([
+    {
+        "start": 0,
+        "spawn_delay": 1.5,
+        "direction_weights": {"right": 0.25, "down": 0.25, "left": 0.25, "up": 0.25},
+    },
+    {
+        "start": 60,
+        "spawn_delay": 1.0,
+        "direction_weights": {"right": 0.35, "down": 0.35, "left": 0.15, "up": 0.15},
+    },
+    {
+        "start": 120,
+        "spawn_delay": 0.6,
+        "direction_weights": {"right": 0.25, "down": 0.25, "left": 0.25, "up": 0.25},
+    },
+    {
+        "start": 180,
+        "spawn_delay": 1.2,
+        "direction_weights": {"right": 0.2, "down": 0.2, "left": 0.3, "up": 0.3},
+    },
+], key=lambda entry: entry["start"])
+
 # set allowed vehicle types here
 allowedVehicleTypes = {'car': True, 'bus': True, 'truck': True, 'bike': True}
 allowedVehicleTypesList = []
@@ -397,9 +424,42 @@ def updateValues():
         else:
             signals[i].red-=1
 
+
+def get_current_density_config():
+    if not trafficDensitySchedule:
+        return {
+            "spawn_delay": 1.0,
+            "direction_weights": {directionNumbers[i]: 1 for i in range(noOfSignals)},
+        }
+
+    applicable_config = trafficDensitySchedule[0]
+    if dynamicTrafficDensity:
+        for entry in trafficDensitySchedule:
+            if timeElapsed >= entry.get("start", 0):
+                applicable_config = entry
+            else:
+                break
+    return applicable_config
+
+
+def choose_direction_number(direction_weights):
+    total_weight = sum(direction_weights.get(directionNumbers[i], 0) for i in range(noOfSignals))
+    if total_weight <= 0:
+        return random.randint(0, noOfSignals - 1)
+
+    pick = random.uniform(0, total_weight)
+    cumulative = 0
+    for i in range(noOfSignals):
+        cumulative += direction_weights.get(directionNumbers[i], 0)
+        if pick <= cumulative:
+            return i
+    return noOfSignals - 1
+
+
 # Generating vehicles in the simulation
 def generateVehicles():
     while(True):
+        density_config = get_current_density_config()
         vehicle_type = random.choice(allowedVehicleTypesList)
         lane_number = random.randint(1,2)
         will_turn = 0
@@ -411,19 +471,10 @@ def generateVehicles():
             temp = random.randint(0,99)
             if(temp<40):
                 will_turn = 1
-        temp = random.randint(0,99)
-        direction_number = 0
-        dist = [25,50,75,100]
-        if(temp<dist[0]):
-            direction_number = 0
-        elif(temp<dist[1]):
-            direction_number = 1
-        elif(temp<dist[2]):
-            direction_number = 2
-        elif(temp<dist[3]):
-            direction_number = 3
+        direction_number = choose_direction_number(density_config.get("direction_weights", {}))
         Vehicle(lane_number, vehicle_type, direction_number, directionNumbers[direction_number], will_turn)
-        time.sleep(1)
+        spawn_delay = max(density_config.get("spawn_delay", 1.0), 0.1)
+        time.sleep(spawn_delay)
 
 def showStats():
     totalVehicles = 0
