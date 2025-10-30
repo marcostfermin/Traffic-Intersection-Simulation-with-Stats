@@ -23,7 +23,6 @@ x = {'right':[0,0,0], 'down':[755,727,697], 'left':[1400,1400,1400], 'up':[602,6
 y = {'right':[348,370,398], 'down':[0,0,0], 'left':[498,466,436], 'up':[800,800,800]}
 
 vehicles = {'right': {0:[], 1:[], 2:[], 'crossed':0}, 'down': {0:[], 1:[], 2:[], 'crossed':0}, 'left': {0:[], 1:[], 2:[], 'crossed':0}, 'up': {0:[], 1:[], 2:[], 'crossed':0}}
-vehicleTypes = {0:'car', 1:'bus', 2:'truck', 3:'bike'}
 directionNumbers = {0:'right', 1:'down', 2:'left', 3:'up'}
 
 # Coordinates of signal image, timer, and vehicle count
@@ -37,6 +36,33 @@ defaultStop = {'right': 580, 'down': 320, 'left': 810, 'up': 545}
 # Gap between vehicles
 stoppingGap = 25    # stopping gap
 movingGap = 25   # moving gap
+
+# Enable dynamic traffic density to vary spawn delay and direction bias over time
+dynamicTrafficDensity = True
+# Each entry defines when the configuration becomes active (in seconds),
+# the delay between spawns, and relative weights for each direction.
+trafficDensitySchedule = sorted([
+    {
+        "start": 0,
+        "spawn_delay": 1.5,
+        "direction_weights": {"right": 0.25, "down": 0.25, "left": 0.25, "up": 0.25},
+    },
+    {
+        "start": 60,
+        "spawn_delay": 1.0,
+        "direction_weights": {"right": 0.35, "down": 0.35, "left": 0.15, "up": 0.15},
+    },
+    {
+        "start": 120,
+        "spawn_delay": 0.6,
+        "direction_weights": {"right": 0.25, "down": 0.25, "left": 0.25, "up": 0.25},
+    },
+    {
+        "start": 180,
+        "spawn_delay": 1.2,
+        "direction_weights": {"right": 0.2, "down": 0.2, "left": 0.3, "up": 0.3},
+    },
+], key=lambda entry: entry["start"])
 
 # set allowed vehicle types here
 allowedVehicleTypes = {'car': True, 'bus': True, 'truck': True, 'bike': True}
@@ -87,23 +113,20 @@ class Vehicle(pygame.sprite.Sprite):
         self.originalImage = pygame.image.load(path)
         self.image = pygame.image.load(path)
 
-        if(len(vehicles[direction][lane])>1 and vehicles[direction][lane][self.index-1].crossed==0):   
+        if(len(vehicles[direction][lane])>1 and vehicles[direction][lane][self.index-1].crossed==0):
+            previous_vehicle = vehicles[direction][lane][self.index-1]
             if(direction=='right'):
-                self.stop = vehicles[direction][lane][self.index-1].stop 
-                - vehicles[direction][lane][self.index-1].image.get_rect().width 
-                - stoppingGap         
+                spacing = previous_vehicle.image.get_rect().width + stoppingGap
+                self.stop = previous_vehicle.stop - spacing
             elif(direction=='left'):
-                self.stop = vehicles[direction][lane][self.index-1].stop 
-                + vehicles[direction][lane][self.index-1].image.get_rect().width 
-                + stoppingGap
+                spacing = previous_vehicle.image.get_rect().width + stoppingGap
+                self.stop = previous_vehicle.stop + spacing
             elif(direction=='down'):
-                self.stop = vehicles[direction][lane][self.index-1].stop 
-                - vehicles[direction][lane][self.index-1].image.get_rect().height 
-                - stoppingGap
+                spacing = previous_vehicle.image.get_rect().height + stoppingGap
+                self.stop = previous_vehicle.stop - spacing
             elif(direction=='up'):
-                self.stop = vehicles[direction][lane][self.index-1].stop 
-                + vehicles[direction][lane][self.index-1].image.get_rect().height 
-                + stoppingGap
+                spacing = previous_vehicle.image.get_rect().height + stoppingGap
+                self.stop = previous_vehicle.stop + spacing
         else:
             self.stop = defaultStop[direction]
             
@@ -401,9 +424,42 @@ def updateValues():
         else:
             signals[i].red-=1
 
+
+def get_current_density_config():
+    if not trafficDensitySchedule:
+        return {
+            "spawn_delay": 1.0,
+            "direction_weights": {directionNumbers[i]: 1 for i in range(noOfSignals)},
+        }
+
+    applicable_config = trafficDensitySchedule[0]
+    if dynamicTrafficDensity:
+        for entry in trafficDensitySchedule:
+            if timeElapsed >= entry.get("start", 0):
+                applicable_config = entry
+            else:
+                break
+    return applicable_config
+
+
+def choose_direction_number(direction_weights):
+    total_weight = sum(direction_weights.get(directionNumbers[i], 0) for i in range(noOfSignals))
+    if total_weight <= 0:
+        return random.randint(0, noOfSignals - 1)
+
+    pick = random.uniform(0, total_weight)
+    cumulative = 0
+    for i in range(noOfSignals):
+        cumulative += direction_weights.get(directionNumbers[i], 0)
+        if pick <= cumulative:
+            return i
+    return noOfSignals - 1
+
+
 # Generating vehicles in the simulation
 def generateVehicles():
     while(True):
+        density_config = get_current_density_config()
         vehicle_type = random.choice(allowedVehicleTypesList)
         lane_number = random.randint(1,2)
         will_turn = 0
@@ -415,19 +471,10 @@ def generateVehicles():
             temp = random.randint(0,99)
             if(temp<40):
                 will_turn = 1
-        temp = random.randint(0,99)
-        direction_number = 0
-        dist = [25,50,75,100]
-        if(temp<dist[0]):
-            direction_number = 0
-        elif(temp<dist[1]):
-            direction_number = 1
-        elif(temp<dist[2]):
-            direction_number = 2
-        elif(temp<dist[3]):
-            direction_number = 3
-        Vehicle(lane_number, vehicleTypes[vehicle_type], direction_number, directionNumbers[direction_number], will_turn)
-        time.sleep(1)
+        direction_number = choose_direction_number(density_config.get("direction_weights", {}))
+        Vehicle(lane_number, vehicle_type, direction_number, directionNumbers[direction_number], will_turn)
+        spawn_delay = max(density_config.get("spawn_delay", 1.0), 0.1)
+        time.sleep(spawn_delay)
 
 def showStats():
     totalVehicles = 0
@@ -450,11 +497,13 @@ def simTime():
 
 class Main:
     global allowedVehicleTypesList
-    i = 0
-    for vehicleType in allowedVehicleTypes:
-        if(allowedVehicleTypes[vehicleType]):
-            allowedVehicleTypesList.append(i)
-        i += 1
+    allowedVehicleTypesList = [
+        vehicle_type
+        for vehicle_type, enabled in allowedVehicleTypes.items()
+        if enabled
+    ]
+    if not allowedVehicleTypesList:
+        raise ValueError("At least one vehicle type must be enabled for the simulation")
     thread1 = threading.Thread(name="initialization",target=initialize, args=())    # initialization
     thread1.daemon = True
     thread1.start()
