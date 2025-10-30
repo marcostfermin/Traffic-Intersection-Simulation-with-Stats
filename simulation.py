@@ -23,7 +23,6 @@ x = {'right':[0,0,0], 'down':[755,727,697], 'left':[1400,1400,1400], 'up':[602,6
 y = {'right':[348,370,398], 'down':[0,0,0], 'left':[498,466,436], 'up':[800,800,800]}
 
 vehicles = {'right': {0:[], 1:[], 2:[], 'crossed':0}, 'down': {0:[], 1:[], 2:[], 'crossed':0}, 'left': {0:[], 1:[], 2:[], 'crossed':0}, 'up': {0:[], 1:[], 2:[], 'crossed':0}}
-vehicleTypes = {0:'car', 1:'bus', 2:'truck', 3:'bike'}
 directionNumbers = {0:'right', 1:'down', 2:'left', 3:'up'}
 
 # Coordinates of signal image, timer, and vehicle count
@@ -87,23 +86,20 @@ class Vehicle(pygame.sprite.Sprite):
         self.originalImage = pygame.image.load(path)
         self.image = pygame.image.load(path)
 
-        if(len(vehicles[direction][lane])>1 and vehicles[direction][lane][self.index-1].crossed==0):   
+        if(len(vehicles[direction][lane])>1 and vehicles[direction][lane][self.index-1].crossed==0):
+            previous_vehicle = vehicles[direction][lane][self.index-1]
             if(direction=='right'):
-                self.stop = vehicles[direction][lane][self.index-1].stop 
-                - vehicles[direction][lane][self.index-1].image.get_rect().width 
-                - stoppingGap         
+                spacing = previous_vehicle.image.get_rect().width + stoppingGap
+                self.stop = previous_vehicle.stop - spacing
             elif(direction=='left'):
-                self.stop = vehicles[direction][lane][self.index-1].stop 
-                + vehicles[direction][lane][self.index-1].image.get_rect().width 
-                + stoppingGap
+                spacing = previous_vehicle.image.get_rect().width + stoppingGap
+                self.stop = previous_vehicle.stop + spacing
             elif(direction=='down'):
-                self.stop = vehicles[direction][lane][self.index-1].stop 
-                - vehicles[direction][lane][self.index-1].image.get_rect().height 
-                - stoppingGap
+                spacing = previous_vehicle.image.get_rect().height + stoppingGap
+                self.stop = previous_vehicle.stop - spacing
             elif(direction=='up'):
-                self.stop = vehicles[direction][lane][self.index-1].stop 
-                + vehicles[direction][lane][self.index-1].image.get_rect().height 
-                + stoppingGap
+                spacing = previous_vehicle.image.get_rect().height + stoppingGap
+                self.stop = previous_vehicle.stop + spacing
         else:
             self.stop = defaultStop[direction]
             
@@ -426,7 +422,7 @@ def generateVehicles():
             direction_number = 2
         elif(temp<dist[3]):
             direction_number = 3
-        Vehicle(lane_number, vehicleTypes[vehicle_type], direction_number, directionNumbers[direction_number], will_turn)
+        Vehicle(lane_number, vehicle_type, direction_number, directionNumbers[direction_number], will_turn)
         time.sleep(1)
 
 def showStats():
@@ -450,11 +446,13 @@ def simTime():
 
 class Main:
     global allowedVehicleTypesList
-    i = 0
-    for vehicleType in allowedVehicleTypes:
-        if(allowedVehicleTypes[vehicleType]):
-            allowedVehicleTypesList.append(i)
-        i += 1
+    allowedVehicleTypesList = [
+        vehicle_type
+        for vehicle_type, enabled in allowedVehicleTypes.items()
+        if enabled
+    ]
+    if not allowedVehicleTypesList:
+        raise ValueError("At least one vehicle type must be enabled for the simulation")
     thread1 = threading.Thread(name="initialization",target=initialize, args=())    # initialization
     thread1.daemon = True
     thread1.start()
