@@ -13,7 +13,7 @@ from typing import Dict, List, Tuple, Optional
 import pygame
 
 # -----------------------------------------------------------------------------
-#  Logging (improvement #10)
+#  Logging
 # -----------------------------------------------------------------------------
 
 logging.basicConfig(
@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 
 # -----------------------------------------------------------------------------
-#  Config + safe reload (improvement #8, #9)
+#  Config + safe reload
 # -----------------------------------------------------------------------------
 
 @dataclass
@@ -38,7 +38,7 @@ class SimulationConfig:
 
     # signal timing
     defaultYellow: int = 5
-    defaultRedBuffer: int = 0  # optional all-red between phases (seconds)
+    defaultRedBuffer: int = 0
     randomGreenSignalTimer: bool = True
     randomGreenSignalTimerRange: Tuple[int, int] = (10, 20)
     defaultGreen: Dict[int, int] = None
@@ -55,7 +55,7 @@ class SimulationConfig:
     stoppingGap: int = 25
     movingGap: int = 25
 
-    # spawn points (constant; spawner checks space, no drifting coords)
+    # spawn points (constant)
     spawnX: Dict[str, List[int]] = None
     spawnY: Dict[str, List[int]] = None
 
@@ -75,8 +75,15 @@ class SimulationConfig:
     greenSignalPath: str = "images/signals/green.png"
     vehicleImageTemplate: str = "images/{direction}/{vehicleClass}.png"
 
-    # speeds in px/sec (dt-based; improvement #6)
+    # speeds in px/sec
     speedsPxPerSec: Dict[str, float] = None
+
+    # collision/physics robustness
+    maxDt: float = 0.05          # cap dt to reduce "jump" collisions
+    broadphaseCell: int = 160    # spatial hash cell size
+    resolveIters: int = 14       # binary search iterations for clamping
+    intersectionRect: Tuple[int, int, int, int] = (610, 340, 180, 180)  # conservative conflict zone
+    conservativeIntersection: bool = True  # if True, only 1 vehicle allowed inside conflict zone
 
     def __post_init__(self):
         if self.defaultGreen is None:
@@ -107,11 +114,9 @@ class SimulationConfig:
             self.mid = {'right': {'x': 705, 'y': 445}, 'down': {'x': 695, 'y': 450}, 'left': {'x': 695, 'y': 425}, 'up': {'x': 695, 'y': 400}}
 
         if self.directionDistribution is None:
-            self.directionDistribution = [25, 50, 75, 100]  # right, down, left, up
+            self.directionDistribution = [25, 50, 75, 100]
 
         if self.speedsPxPerSec is None:
-            # Original was ~2 px/frame at variable FPS. Use stable px/sec.
-            # 2.25 px/frame @ 60 fps ~ 135 px/sec (car)
             self.speedsPxPerSec = {'car': 135.0, 'bus': 108.0, 'truck': 108.0, 'bike': 150.0}
 
 def load_config_from_file(path: str, base: SimulationConfig) -> SimulationConfig:
@@ -128,7 +133,7 @@ def load_config_from_file(path: str, base: SimulationConfig) -> SimulationConfig
         return base
 
 # -----------------------------------------------------------------------------
-#  Assets validation (improvement #9)
+#  Assets validation
 # -----------------------------------------------------------------------------
 
 class AssetManager:
@@ -156,15 +161,17 @@ class AssetManager:
         return img
 
 # -----------------------------------------------------------------------------
-#  Signals: event-driven tick-based controller (improvement #5)
+#  Signals: tick-based controller
 # -----------------------------------------------------------------------------
 
-class SignalPhase:
-    def __init__(self, green_dir_index: int, green_sec: int, yellow_sec: int, all_red_sec: int):
-        self.green_dir_index = green_dir_index
-        self.green_sec = green_sec
-        self.yellow_sec = yellow_sec
-        self.all_red_sec = all_red_sec
+def clamp(v, lo, hi):
+    return lo if v < lo else hi if v > hi else v
+
+def dist(a: Tuple[float, float], b: Tuple[float, float]) -> float:
+    return math.hypot(b[0]-a[0], b[1]-a[1])
+
+def angle_deg_from_vec(dx: float, dy: float) -> float:
+    return math.degrees(math.atan2(-dy, dx))
 
 class SignalController:
     def __init__(self, config: SimulationConfig):
@@ -172,41 +179,36 @@ class SignalController:
         self.noOfSignals = 4
         self.currentGreen = 0
         self.currentYellow = 0
-        self.time_in_phase = 0.0
 
         self._phase_state = "GREEN"  # GREEN, YELLOW, ALL_RED
-        self._green_remaining = 0
-        self._yellow_remaining = 0
-        self._all_red_remaining = 0
+        self._green_remaining = 0.0
+        self._yellow_remaining = 0.0
+        self._all_red_remaining = 0.0
 
         self._set_new_green(self.currentGreen)
 
-    def _pick_green_time(self, idx: int) -> int:
+    def _pick_green_time(self, idx: int) -> float:
         if self.config.randomGreenSignalTimer:
-            return random.randint(self.config.randomGreenSignalTimerRange[0], self.config.randomGreenSignalTimerRange[1])
-        return self.config.defaultGreen[idx]
+            return float(random.randint(self.config.randomGreenSignalTimerRange[0], self.config.randomGreenSignalTimerRange[1]))
+        return float(self.config.defaultGreen[idx])
 
     def _set_new_green(self, idx: int):
         self.currentGreen = idx
         self.currentYellow = 0
         self._phase_state = "GREEN"
         self._green_remaining = self._pick_green_time(idx)
-        self._yellow_remaining = self.config.defaultYellow
-        self._all_red_remaining = self.config.defaultRedBuffer
-        self.time_in_phase = 0.0
+        self._yellow_remaining = float(self.config.defaultYellow)
+        self._all_red_remaining = float(self.config.defaultRedBuffer)
 
     def tick(self, dt: float):
         if dt <= 0:
             return
-
-        self.time_in_phase += dt
 
         if self._phase_state == "GREEN":
             self._green_remaining -= dt
             if self._green_remaining <= 0:
                 self._phase_state = "YELLOW"
                 self.currentYellow = 1
-                self.time_in_phase = 0.0
 
         elif self._phase_state == "YELLOW":
             self._yellow_remaining -= dt
@@ -216,13 +218,11 @@ class SignalController:
                     self._phase_state = "ALL_RED"
                 else:
                     self._advance_to_next_green()
-                self.time_in_phase = 0.0
 
         elif self._phase_state == "ALL_RED":
             self._all_red_remaining -= dt
             if self._all_red_remaining <= 0:
                 self._advance_to_next_green()
-                self.time_in_phase = 0.0
 
     def _advance_to_next_green(self):
         next_green = (self.currentGreen + 1) % self.noOfSignals
@@ -236,24 +236,11 @@ class SignalController:
             if self.currentYellow == 1:
                 return str(max(0, int(math.ceil(self._yellow_remaining))))
             return str(max(0, int(math.ceil(self._green_remaining))))
-        # show remaining red only when close (like original), but red is implicit now
-        # approximate "red remaining" as total time until that signal gets green again:
-        # sum of remaining in current phase + phases of others.
-        # For UI simplicity (no dead complexity), keep "---" always for red.
         return "---"
 
 # -----------------------------------------------------------------------------
-#  Paths + movement strategies (improvement #1, #2, #3)
+#  Paths (for turning)
 # -----------------------------------------------------------------------------
-
-def clamp(v, lo, hi):
-    return lo if v < lo else hi if v > hi else v
-
-def dist(a: Tuple[float, float], b: Tuple[float, float]) -> float:
-    return math.hypot(b[0]-a[0], b[1]-a[1])
-
-def angle_deg_from_vec(dx: float, dy: float) -> float:
-    return math.degrees(math.atan2(-dy, dx))
 
 class Path:
     def __init__(self, points: List[Tuple[float, float]]):
@@ -272,7 +259,6 @@ class Path:
         if self.length <= 1e-9:
             return self.points[-1]
         s = clamp(s, 0.0, self.length)
-        # find segment
         for i in range(len(self._seg_len)):
             if s <= self._cum[i+1]:
                 seg_s = s - self._cum[i]
@@ -289,8 +275,7 @@ class Path:
         if len(self.points) < 2:
             return 0.0
         s = clamp(s, 0.0, self.length)
-        # small lookahead to compute heading
-        eps = 5.0
+        eps = 6.0
         p1 = self.sample(s)
         p2 = self.sample(clamp(s+eps, 0.0, self.length))
         dx = p2[0]-p1[0]
@@ -299,26 +284,8 @@ class Path:
             return 0.0
         return angle_deg_from_vec(dx, dy)
 
-class MovementStrategy:
-    def step(self, vehicle, dt: float):
-        raise NotImplementedError
-
-class StraightMovement(MovementStrategy):
-    def step(self, vehicle, dt: float):
-        vehicle._advance_along_lane(dt)
-
-class TurningMovement(MovementStrategy):
-    def step(self, vehicle, dt: float):
-        # while not entered path, still advance along lane until "turn start"
-        if not vehicle.in_turn_path:
-            vehicle._advance_along_lane(dt)
-            if vehicle._should_enter_turn():
-                vehicle._enter_turn_path()
-        else:
-            vehicle._advance_along_path(dt)
-
 # -----------------------------------------------------------------------------
-#  World state (encapsulation) + lane management (improvement #3, #7)
+#  World state + stats
 # -----------------------------------------------------------------------------
 
 class WorldState:
@@ -327,9 +294,7 @@ class WorldState:
         self.signalController = signalController
 
         self.directionNumbers = {0: 'right', 1: 'down', 2: 'left', 3: 'up'}
-        self.vehicleTypes = ['car', 'bus', 'truck', 'bike']
 
-        # lane registry
         self.vehicles: Dict[str, Dict[int, List["Vehicle"]]] = {
             'right': {1: [], 2: []},
             'down': {1: [], 2: []},
@@ -337,15 +302,23 @@ class WorldState:
             'up': {1: [], 2: []},
         }
 
-        # crossed counts by direction
         self.crossed = {'right': 0, 'down': 0, 'left': 0, 'up': 0}
 
-        # pygame group
         self.simulation = pygame.sprite.Group()
 
-        # stats sampling
         self.queue_len_samples = {'right': [], 'down': [], 'left': [], 'up': []}
-        self.throughput_events: List[Tuple[float, str]] = []  # (time, direction)
+        self.throughput_events: List[Tuple[float, str]] = []
+
+        # collision/reservation
+        self.intersection_rect = pygame.Rect(*self.config.intersectionRect)
+        self.intersection_owner_id: Optional[int] = None
+
+    def all_vehicles(self) -> List["Vehicle"]:
+        out = []
+        for d in ['right', 'down', 'left', 'up']:
+            for lane in [1, 2]:
+                out.extend(self.vehicles[d][lane])
+        return out
 
     def lane_list(self, direction: str, lane: int) -> List["Vehicle"]:
         return self.vehicles[direction][lane]
@@ -355,19 +328,20 @@ class WorldState:
         self.simulation.add(v)
 
     def unregister_vehicle(self, v: "Vehicle"):
-        # safe remove if present
         lane = self.vehicles[v.direction][v.lane]
         if v in lane:
             lane.remove(v)
         if v in self.simulation:
             self.simulation.remove(v)
 
+        if self.intersection_owner_id == v.vid:
+            self.intersection_owner_id = None
+
     def record_crossed(self, direction: str, now_s: float):
         self.crossed[direction] += 1
         self.throughput_events.append((now_s, direction))
 
     def sample_queue_lengths(self):
-        # define queue length as vehicles that have not crossed stop line
         for d in ['right', 'down', 'left', 'up']:
             q = 0
             for lane in [1, 2]:
@@ -377,10 +351,259 @@ class WorldState:
             self.queue_len_samples[d].append(q)
 
 # -----------------------------------------------------------------------------
-#  Vehicle (inheritance + polymorphism via subclasses & strategy) (improvement #1)
+#  Strong collision handling:
+#   - dt cap
+#   - spawn clearance (handled in Spawner)
+#   - same-lane clamping (prevents rear from overtaking/overlapping front)
+#   - broadphase spatial hash + binary-search clamping against ALL vehicles
+#   - conservative intersection reservation (prevents cross-direction conflicts)
+# -----------------------------------------------------------------------------
+
+class CollisionManager:
+    def __init__(self, world: WorldState):
+        self.world = world
+        self.config = world.config
+
+    def _cell(self, x: float, y: float) -> Tuple[int, int]:
+        s = self.config.broadphaseCell
+        return (int(x) // s, int(y) // s)
+
+    def _build_spatial_hash(self) -> Dict[Tuple[int, int], List["Vehicle"]]:
+        grid: Dict[Tuple[int, int], List["Vehicle"]] = {}
+        for v in self.world.all_vehicles():
+            r = v.rect()
+            c1 = self._cell(r.left, r.top)
+            c2 = self._cell(r.right, r.bottom)
+            for cx in range(c1[0], c2[0] + 1):
+                for cy in range(c1[1], c2[1] + 1):
+                    grid.setdefault((cx, cy), []).append(v)
+        return grid
+
+    def _nearby_candidates(self, grid: Dict[Tuple[int, int], List["Vehicle"]], rect: pygame.Rect) -> List["Vehicle"]:
+        c1 = self._cell(rect.left, rect.top)
+        c2 = self._cell(rect.right, rect.bottom)
+        out = []
+        seen = set()
+        for cx in range(c1[0] - 1, c2[0] + 2):
+            for cy in range(c1[1] - 1, c2[1] + 2):
+                for v in grid.get((cx, cy), []):
+                    if v.vid not in seen:
+                        seen.add(v.vid)
+                        out.append(v)
+        return out
+
+    def _intersection_entering(self, v: "Vehicle", new_rect: pygame.Rect) -> bool:
+        ir = self.world.intersection_rect
+        return (not v.rect().colliderect(ir)) and new_rect.colliderect(ir)
+
+    def _intersection_inside(self, rect: pygame.Rect) -> bool:
+        return rect.colliderect(self.world.intersection_rect)
+
+    def _intersection_allowed(self, v: "Vehicle", new_rect: pygame.Rect) -> bool:
+        if not self.config.conservativeIntersection:
+            return True
+
+        ir = self.world.intersection_rect
+
+        if not new_rect.colliderect(ir):
+            if self.world.intersection_owner_id == v.vid:
+                self.world.intersection_owner_id = None
+            return True
+
+        # If already owner, always allowed
+        if self.world.intersection_owner_id == v.vid:
+            return True
+
+        # If nobody owns it, acquire when entering (or when trying to be inside)
+        if self.world.intersection_owner_id is None:
+            self.world.intersection_owner_id = v.vid
+            return True
+
+        # Otherwise blocked
+        return False
+
+    def resolve_all(self, dt: float, now_s: float):
+        # Build broadphase grid once per frame
+        grid = self._build_spatial_hash()
+
+        # Update in a stable order:
+        # front-to-back per direction lane so clamping becomes consistent.
+        # If vehicles overlap already, this still avoids the worst "rear pushes front" issues.
+        ordered = self._ordered_update_list()
+        for v in ordered:
+            if not v.alive:
+                continue
+            self.resolve_vehicle(v, dt, now_s, grid)
+
+    def _ordered_update_list(self) -> List["Vehicle"]:
+        out = []
+        for d in ['right', 'down', 'left', 'up']:
+            for lane in [1, 2]:
+                lane_list = self.world.lane_list(d, lane)
+                # sort by along-lane progress so front vehicles update first
+                lane_sorted = sorted(lane_list, key=lambda vv: vv.length_along_lane())
+                out.extend(lane_sorted)
+        return out
+
+    def resolve_vehicle(self, v: "Vehicle", dt: float, now_s: float, grid: Dict[Tuple[int, int], List["Vehicle"]]):
+        # 1) Cap dt at config.maxDt by splitting into substeps
+        # This prevents large dt jumps creating unavoidable overlaps.
+        remaining = dt
+        while remaining > 1e-9 and v.alive:
+            step_dt = remaining if remaining <= self.config.maxDt else self.config.maxDt
+            remaining -= step_dt
+            self._resolve_vehicle_substep(v, step_dt, now_s, grid)
+
+    def _resolve_vehicle_substep(self, v: "Vehicle", dt: float, now_s: float, grid: Dict[Tuple[int, int], List["Vehicle"]]):
+        # Compute intended motion scalar (lane step or path step)
+        v.prepare_motion(dt)
+
+        if v.pending_kind is None or v.pending_amount <= 0.0:
+            v.post_motion(now_s)  # still allow crossed check / cleanup
+            return
+
+        # 2) Same-lane hard clamp to prevent rear overlapping front (robust for straight & turning alike)
+        max_fraction_lane = self._lane_clamp_fraction(v)
+
+        # 3) Intersection reservation clamp
+        max_fraction_intersection = self._intersection_clamp_fraction(v, grid)
+
+        # 4) Broad collision clamp against ALL nearby vehicles using binary search
+        max_fraction_broad = self._broad_collision_clamp_fraction(v, grid)
+
+        # apply the most conservative clamp
+        f = min(1.0, max_fraction_lane, max_fraction_intersection, max_fraction_broad)
+        if f < 0.0:
+            f = 0.0
+
+        v.apply_motion_fraction(f)
+        v.post_motion(now_s)
+
+    def _lane_clamp_fraction(self, v: "Vehicle") -> float:
+        # Strong lane clamping: ensure proposed motion doesn't violate movingGap relative to front.
+        front = v.front_vehicle()
+        if front is None or (not front.alive):
+            return 1.0
+
+        # If front is in same lane, enforce gap using current front rect (conservative).
+        mg = float(self.config.movingGap)
+
+        # compute my current and intended
+        if v.pending_kind == "lane":
+            step = v.pending_amount
+            if v.direction == 'right':
+                my_front_now = v.x + v.image.get_rect().width
+                front_back = front.x - mg
+                max_move = front_back - my_front_now
+                if max_move <= 0:
+                    return 0.0
+                return clamp(max_move / step, 0.0, 1.0)
+
+            if v.direction == 'left':
+                my_back_now = v.x
+                front_front = front.x + front.image.get_rect().width + mg
+                max_move = my_back_now - front_front
+                if max_move <= 0:
+                    return 0.0
+                return clamp(max_move / step, 0.0, 1.0)
+
+            if v.direction == 'down':
+                my_front_now = v.y + v.image.get_rect().height
+                front_back = front.y - mg
+                max_move = front_back - my_front_now
+                if max_move <= 0:
+                    return 0.0
+                return clamp(max_move / step, 0.0, 1.0)
+
+            if v.direction == 'up':
+                my_back_now = v.y
+                front_front = front.y + front.image.get_rect().height + mg
+                max_move = my_back_now - front_front
+                if max_move <= 0:
+                    return 0.0
+                return clamp(max_move / step, 0.0, 1.0)
+
+            return 1.0
+
+        # For path movement, do broadphase clamp; lane clamp doesn't apply cleanly.
+        return 1.0
+
+    def _intersection_clamp_fraction(self, v: "Vehicle", grid: Dict[Tuple[int, int], List["Vehicle"]]) -> float:
+        # If conservative intersection is on, do NOT allow entering/being inside unless you own it.
+        # We clamp motion via binary search to stop at the border if not allowed.
+        if not self.config.conservativeIntersection:
+            return 1.0
+
+        test_rect_full = v.proposed_rect_for_fraction(1.0)
+        if not test_rect_full.colliderect(self.world.intersection_rect):
+            return 1.0
+
+        # If fully allowed, no clamp.
+        if self._intersection_allowed(v, test_rect_full):
+            return 1.0
+
+        # Otherwise, binary search largest fraction that does NOT violate intersection rule.
+        lo = 0.0
+        hi = 1.0
+        for _ in range(self.config.resolveIters):
+            mid = (lo + hi) * 0.5
+            r = v.proposed_rect_for_fraction(mid)
+            if self._intersection_allowed(v, r):
+                lo = mid
+            else:
+                hi = mid
+        return lo
+
+    def _broad_collision_clamp_fraction(self, v: "Vehicle", grid: Dict[Tuple[int, int], List["Vehicle"]]) -> float:
+        # Binary search fraction that avoids colliding with any other vehicle rect.
+        # This handles:
+        # - straight/straight collisions across lanes
+        # - turning/straight overlaps
+        # - turning/turning overlaps
+        # - any weird geometry or dt corner cases
+        #
+        # It is conservative because it tests AABB overlap; rotation changes rect size but
+        # pygame uses rotated surface rect; this is still safer than ignoring rotation.
+
+        test_full = v.proposed_rect_for_fraction(1.0)
+        candidates = self._nearby_candidates(grid, test_full)
+
+        # quick check if full move is safe
+        if self._rect_safe_against_candidates(v, test_full, candidates):
+            return 1.0
+
+        lo = 0.0
+        hi = 1.0
+        for _ in range(self.config.resolveIters):
+            mid = (lo + hi) * 0.5
+            r = v.proposed_rect_for_fraction(mid)
+            if self._rect_safe_against_candidates(v, r, candidates):
+                lo = mid
+            else:
+                hi = mid
+        return lo
+
+    def _rect_safe_against_candidates(self, v: "Vehicle", rect: pygame.Rect, candidates: List["Vehicle"]) -> bool:
+        # also include intersection reservation rule for safety
+        if not self._intersection_allowed(v, rect):
+            return False
+
+        for other in candidates:
+            if other.vid == v.vid:
+                continue
+            if not other.alive:
+                continue
+            if rect.colliderect(other.rect()):
+                return False
+        return True
+
+# -----------------------------------------------------------------------------
+#  Vehicle
 # -----------------------------------------------------------------------------
 
 class Vehicle(pygame.sprite.Sprite):
+    _VID_COUNTER = 1
+
     def __init__(
         self,
         assets: AssetManager,
@@ -396,43 +619,43 @@ class Vehicle(pygame.sprite.Sprite):
         self.world = world
         self.config = world.config
 
+        self.vid = Vehicle._VID_COUNTER
+        Vehicle._VID_COUNTER += 1
+
         self.vehicleClass = vehicleClass
         self.direction_number = direction_number
         self.direction = direction
         self.lane = lane
         self.willTurn = will_turn
 
-        self.speed = self.config.speedsPxPerSec[vehicleClass]
+        self.speed = float(self.config.speedsPxPerSec[vehicleClass])
 
-        # images
         path = self.config.vehicleImageTemplate.format(direction=direction, vehicleClass=vehicleClass)
         self.originalImage = self.assets.image(path)
         self.image = self.originalImage
 
-        # position
-        sx = self.config.spawnX[direction][lane]
-        sy = self.config.spawnY[direction][lane]
-        self.x = float(sx)
-        self.y = float(sy)
+        self.x = float(self.config.spawnX[direction][lane])
+        self.y = float(self.config.spawnY[direction][lane])
 
-        # state
         self.has_crossed = False
         self.in_turn_path = False
         self.turn_progress = 0.0
         self.turn_path: Optional[Path] = None
-        self.turn_start_condition = None  # set below
-        self._rotation = 0.0
 
-        # movement strategy
-        self.mover: MovementStrategy = TurningMovement() if self.willTurn == 1 else StraightMovement()
+        self.turn_start_condition = None
+        self._turn_points_template: List[Tuple[float, float]] = []
 
-        # compute stop position based on front vehicle (centralized spacing)
-        self.stop = self._compute_initial_stop()
+        self.stop = float(self.config.defaultStop[self.direction])
+        self._compute_stop_from_front()
 
-        # determine when to enter turn path
         self._configure_turn_gate_and_path()
 
-        # register
+        self.pending_kind: Optional[str] = None     # "lane" or "path"
+        self.pending_amount: float = 0.0           # px (lane) or path distance increment
+        self.pending_dt: float = 0.0
+
+        self.alive = True
+
         self.world.register_vehicle(self)
 
     def rect(self) -> pygame.Rect:
@@ -441,7 +664,6 @@ class Vehicle(pygame.sprite.Sprite):
         return r
 
     def length_along_lane(self) -> float:
-        # used for ordering and spacing (higher means further along movement direction)
         if self.direction == 'right':
             return self.x
         if self.direction == 'left':
@@ -452,11 +674,9 @@ class Vehicle(pygame.sprite.Sprite):
             return -self.y
         return 0.0
 
-    def _front_vehicle(self) -> Optional["Vehicle"]:
+    def front_vehicle(self) -> Optional["Vehicle"]:
         lane = self.world.lane_list(self.direction, self.lane)
-        # sort by progress
         ordered = sorted(lane, key=lambda v: v.length_along_lane())
-        # find self in ordered list
         try:
             idx = ordered.index(self)
         except ValueError:
@@ -465,41 +685,29 @@ class Vehicle(pygame.sprite.Sprite):
             return None
         return ordered[idx-1]
 
-    def _compute_initial_stop(self) -> float:
-        front = self._front_vehicle()
-        if front is None or front.has_crossed:
-            return float(self.config.defaultStop[self.direction])
+    def _compute_stop_from_front(self):
+        front = self.front_vehicle()
+        if front is None:
+            self.stop = float(self.config.defaultStop[self.direction])
+            return
+        if front.has_crossed:
+            self.stop = float(self.config.defaultStop[self.direction])
+            return
 
         fg = float(self.config.stoppingGap)
         if self.direction == 'right':
-            return float(front.stop - front.image.get_rect().width - fg)
-        if self.direction == 'left':
-            return float(front.stop + front.image.get_rect().width + fg)
-        if self.direction == 'down':
-            return float(front.stop - front.image.get_rect().height - fg)
-        if self.direction == 'up':
-            return float(front.stop + front.image.get_rect().height + fg)
-        return float(self.config.defaultStop[self.direction])
-
-    def _gap_ok(self) -> bool:
-        front = self._front_vehicle()
-        if front is None:
-            return True
-
-        mg = float(self.config.movingGap)
-        if self.direction == 'right':
-            return (self.x + self.image.get_rect().width) < (front.x - mg) or front.in_turn_path
-        if self.direction == 'left':
-            return self.x > (front.x + front.image.get_rect().width + mg) or front.in_turn_path
-        if self.direction == 'down':
-            return (self.y + self.image.get_rect().height) < (front.y - mg) or front.in_turn_path
-        if self.direction == 'up':
-            return self.y > (front.y + front.image.get_rect().height + mg) or front.in_turn_path
-        return True
+            self.stop = float(front.stop - front.image.get_rect().width - fg)
+        elif self.direction == 'left':
+            self.stop = float(front.stop + front.image.get_rect().width + fg)
+        elif self.direction == 'down':
+            self.stop = float(front.stop - front.image.get_rect().height - fg)
+        elif self.direction == 'up':
+            self.stop = float(front.stop + front.image.get_rect().height + fg)
+        else:
+            self.stop = float(self.config.defaultStop[self.direction])
 
     def _signal_allows(self) -> bool:
         currentGreen, currentYellow = self.world.signalController.get_state()
-        # mapping: 0 right, 1 down, 2 left, 3 up
         my_green_index = self.direction_number
         if self.has_crossed:
             return True
@@ -519,6 +727,124 @@ class Vehicle(pygame.sprite.Sprite):
             return self.y >= sl
         return True
 
+    def _at_or_past_stop_point(self) -> bool:
+        if self.direction == 'right':
+            return (self.x + self.image.get_rect().width) >= self.stop
+        if self.direction == 'left':
+            return self.x <= self.stop
+        if self.direction == 'down':
+            return (self.y + self.image.get_rect().height) >= self.stop
+        if self.direction == 'up':
+            return self.y <= self.stop
+        return False
+
+    def _configure_turn_gate_and_path(self):
+        m = self.config.mid[self.direction]
+        cx, cy = float(m['x']), float(m['y'])
+
+        if self.direction == 'right':
+            if self.lane == 1:
+                enter_x = self.config.stopLines['right'] + 40
+                self.turn_start_condition = ("x_gt", float(enter_x))
+                pts = [
+                    (cx, float(self.y)),
+                    (cx, 250.0),
+                    (cx, 160.0)
+                ]
+            else:
+                enter_x = float(self.config.mid['right']['x'])
+                self.turn_start_condition = ("x_gt", enter_x)
+                pts = [
+                    (cx, float(self.y)),
+                    (cx, 650.0),
+                    (cx, 760.0)
+                ]
+
+        elif self.direction == 'down':
+            if self.lane == 1:
+                enter_y = self.config.stopLines['down'] + 50
+                self.turn_start_condition = ("y_gt", float(enter_y))
+                pts = [
+                    (float(self.x), cy),
+                    (900.0, cy),
+                    (1050.0, cy)
+                ]
+            else:
+                enter_y = float(self.config.mid['down']['y'])
+                self.turn_start_condition = ("y_gt", enter_y)
+                pts = [
+                    (float(self.x), cy),
+                    (450.0, cy),
+                    (300.0, cy)
+                ]
+
+        elif self.direction == 'left':
+            if self.lane == 1:
+                enter_x = self.config.stopLines['left'] - 70
+                self.turn_start_condition = ("x_lt", float(enter_x))
+                pts = [
+                    (cx, float(self.y)),
+                    (cx, 650.0),
+                    (cx, 760.0)
+                ]
+            else:
+                enter_x = float(self.config.mid['left']['x'])
+                self.turn_start_condition = ("x_lt", enter_x)
+                pts = [
+                    (cx, float(self.y)),
+                    (cx, 250.0),
+                    (cx, 160.0)
+                ]
+
+        elif self.direction == 'up':
+            if self.lane == 1:
+                enter_y = self.config.stopLines['up'] - 60
+                self.turn_start_condition = ("y_lt", float(enter_y))
+                pts = [
+                    (float(self.x), cy),
+                    (450.0, cy),
+                    (300.0, cy)
+                ]
+            else:
+                enter_y = float(self.config.mid['up']['y'])
+                self.turn_start_condition = ("y_lt", enter_y)
+                pts = [
+                    (float(self.x), cy),
+                    (900.0, cy),
+                    (1050.0, cy)
+                ]
+
+        else:
+            self.turn_start_condition = None
+            pts = []
+
+        self._turn_points_template = [(float(px), float(py)) for (px, py) in pts]
+
+    def _should_enter_turn(self) -> bool:
+        if self.willTurn != 1:
+            return False
+        if self.in_turn_path:
+            return False
+        if self.turn_start_condition is None:
+            return False
+        kind, threshold = self.turn_start_condition
+        if kind == "x_gt":
+            return (self.x + self.image.get_rect().width) >= threshold
+        if kind == "x_lt":
+            return self.x <= threshold
+        if kind == "y_gt":
+            return (self.y + self.image.get_rect().height) >= threshold
+        if kind == "y_lt":
+            return self.y <= threshold
+        return False
+
+    def _enter_turn_path(self):
+        self.in_turn_path = True
+        self.turn_progress = 0.0
+        start = (float(self.x), float(self.y))
+        pts = [start] + self._turn_points_template
+        self.turn_path = Path(pts)
+
     def _mark_crossed_if_needed(self, now_s: float):
         if self.has_crossed:
             return
@@ -536,196 +862,121 @@ class Vehicle(pygame.sprite.Sprite):
             self.has_crossed = True
             self.world.record_crossed(self.direction, now_s)
 
-    def _configure_turn_gate_and_path(self):
-        # Parametric pathing using waypoints (improvement #2).
-        # Keep it simple and robust: enter path near "mid" anchors.
-        m = self.config.mid[self.direction]
-        cx, cy = float(m['x']), float(m['y'])
+    def prepare_motion(self, dt: float):
+        self.pending_dt = dt
+        self.pending_kind = None
+        self.pending_amount = 0.0
 
-        # Define exit points for turning (approximate based on existing visuals).
-        # These are tuned to the provided intersection image coordinates.
-        # Lane 1 and lane 2 differ slightly to mimic original behavior.
-        if self.direction == 'right':
-            # right -> up (lane1) or right -> down (lane2)
-            if self.lane == 1:
-                enter_x = self.config.stopLines['right'] + 40
-                self.turn_start_condition = ("x_gt", float(enter_x))
-                points = [
-                    (self.x, self.y),
-                    (cx, float(self.y)),
-                    (cx, 250.0),
-                    (cx, 160.0)
-                ]
-            else:
-                enter_x = float(self.config.mid['right']['x'])
-                self.turn_start_condition = ("x_gt", enter_x)
-                points = [
-                    (self.x, self.y),
-                    (cx, float(self.y)),
-                    (cx, 650.0),
-                    (cx, 760.0)
-                ]
+        # Decide whether to initiate turn this tick (based on current position)
+        if self._should_enter_turn():
+            self._enter_turn_path()
 
-        elif self.direction == 'down':
-            # down -> right (lane1) or down -> left (lane2)
-            if self.lane == 1:
-                enter_y = self.config.stopLines['down'] + 50
-                self.turn_start_condition = ("y_gt", float(enter_y))
-                points = [
-                    (self.x, self.y),
-                    (float(self.x), cy),
-                    (900.0, cy),
-                    (1050.0, cy)
-                ]
-            else:
-                enter_y = float(self.config.mid['down']['y'])
-                self.turn_start_condition = ("y_gt", enter_y)
-                points = [
-                    (self.x, self.y),
-                    (float(self.x), cy),
-                    (450.0, cy),
-                    (300.0, cy)
-                ]
+        # Determine intended motion
+        if self.in_turn_path and self.turn_path is not None:
+            # Path motion: always attempt to advance along path
+            self.pending_kind = "path"
+            self.pending_amount = self.speed * dt
+            return
 
-        elif self.direction == 'left':
-            # left -> down (lane1) or left -> up (lane2)
-            if self.lane == 1:
-                enter_x = self.config.stopLines['left'] - 70
-                self.turn_start_condition = ("x_lt", float(enter_x))
-                points = [
-                    (self.x, self.y),
-                    (cx, float(self.y)),
-                    (cx, 650.0),
-                    (cx, 760.0)
-                ]
-            else:
-                enter_x = float(self.config.mid['left']['x'])
-                self.turn_start_condition = ("x_lt", enter_x)
-                points = [
-                    (self.x, self.y),
-                    (cx, float(self.y)),
-                    (cx, 250.0),
-                    (cx, 160.0)
-                ]
-
-        elif self.direction == 'up':
-            # up -> left (lane1) or up -> right (lane2)
-            if self.lane == 1:
-                enter_y = self.config.stopLines['up'] - 60
-                self.turn_start_condition = ("y_lt", float(enter_y))
-                points = [
-                    (self.x, self.y),
-                    (float(self.x), cy),
-                    (450.0, cy),
-                    (300.0, cy)
-                ]
-            else:
-                enter_y = float(self.config.mid['up']['y'])
-                self.turn_start_condition = ("y_lt", enter_y)
-                points = [
-                    (self.x, self.y),
-                    (float(self.x), cy),
-                    (900.0, cy),
-                    (1050.0, cy)
-                ]
-
-        else:
-            self.turn_start_condition = None
-            points = [(self.x, self.y)]
-
-        # path will be rebuilt at entry with current start; store template waypoints beyond start
-        self._turn_points_template = points[1:] if len(points) > 1 else [(self.x, self.y)]
-
-    def _should_enter_turn(self) -> bool:
-        if self.turn_start_condition is None:
-            return False
-        kind, threshold = self.turn_start_condition
-        if kind == "x_gt":
-            return self.x + self.image.get_rect().width >= threshold
-        if kind == "x_lt":
-            return self.x <= threshold
-        if kind == "y_gt":
-            return self.y + self.image.get_rect().height >= threshold
-        if kind == "y_lt":
-            return self.y <= threshold
-        return False
-
-    def _enter_turn_path(self):
-        self.in_turn_path = True
-        self.turn_progress = 0.0
-        start = (float(self.x), float(self.y))
-        points = [start] + [(float(px), float(py)) for (px, py) in self._turn_points_template]
-        self.turn_path = Path(points)
-
-    def _advance_along_lane(self, dt: float):
-        # obey signals and spacing before crossing stop line
+        # Lane motion: obey signals and stop behavior BEFORE crossing stop line
+        # The collision manager will further clamp by front + broad collisions.
         if (not self.has_crossed) and self._is_before_stop_line():
-            if (not self._signal_allows()):
-                # can still roll up to stop point if spaced ok
-                if not self._gap_ok():
-                    return
-                # move until stop coordinate
-                if self.direction == 'right':
-                    if (self.x + self.image.get_rect().width) >= self.stop:
-                        return
-                elif self.direction == 'left':
-                    if self.x <= self.stop:
-                        return
-                elif self.direction == 'down':
-                    if (self.y + self.image.get_rect().height) >= self.stop:
-                        return
-                elif self.direction == 'up':
-                    if self.y <= self.stop:
-                        return
-            else:
-                if not self._gap_ok():
+            if not self._signal_allows():
+                # if at stop point, don't move
+                if self._at_or_past_stop_point():
                     return
 
-        # move
-        step = self.speed * dt
-        if self.direction == 'right':
-            self.x += step
-        elif self.direction == 'left':
-            self.x -= step
-        elif self.direction == 'down':
-            self.y += step
-        elif self.direction == 'up':
-            self.y -= step
+        self.pending_kind = "lane"
+        self.pending_amount = self.speed * dt
 
-    def _advance_along_path(self, dt: float):
-        if self.turn_path is None:
-            self.in_turn_path = False
+    def proposed_state_for_fraction(self, fraction: float) -> Tuple[float, float, pygame.Surface]:
+        # Return (x, y, image) if motion applied partially
+        fraction = clamp(fraction, 0.0, 1.0)
+        if self.pending_kind is None or self.pending_amount <= 0.0 or fraction <= 0.0:
+            return (self.x, self.y, self.image)
+
+        if self.pending_kind == "lane":
+            step = self.pending_amount * fraction
+            nx, ny = self.x, self.y
+            if self.direction == 'right':
+                nx += step
+            elif self.direction == 'left':
+                nx -= step
+            elif self.direction == 'down':
+                ny += step
+            elif self.direction == 'up':
+                ny -= step
+            return (nx, ny, self.image)
+
+        if self.pending_kind == "path":
+            if self.turn_path is None:
+                return (self.x, self.y, self.image)
+            # sample at hypothetical progress
+            p = self.turn_progress + (self.pending_amount * fraction)
+            if p >= self.turn_path.length:
+                end = self.turn_path.sample(self.turn_path.length)
+                return (end[0], end[1], self.originalImage)
+            pos = self.turn_path.sample(p)
+            heading = self.turn_path.heading(p)
+            img = pygame.transform.rotate(self.originalImage, heading)
+            return (pos[0], pos[1], img)
+
+        return (self.x, self.y, self.image)
+
+    def proposed_rect_for_fraction(self, fraction: float) -> pygame.Rect:
+        nx, ny, img = self.proposed_state_for_fraction(fraction)
+        r = img.get_rect()
+        r.topleft = (int(nx), int(ny))
+        return r
+
+    def apply_motion_fraction(self, fraction: float):
+        fraction = clamp(fraction, 0.0, 1.0)
+        if self.pending_kind is None or self.pending_amount <= 0.0 or fraction <= 0.0:
             return
-        self.turn_progress += self.speed * dt
-        if self.turn_progress >= self.turn_path.length:
-            end = self.turn_path.sample(self.turn_path.length)
-            self.x, self.y = end[0], end[1]
-            self.in_turn_path = False
-            self.turn_path = None
-            self.image = self.originalImage
+
+        if self.pending_kind == "lane":
+            step = self.pending_amount * fraction
+            if self.direction == 'right':
+                self.x += step
+            elif self.direction == 'left':
+                self.x -= step
+            elif self.direction == 'down':
+                self.y += step
+            elif self.direction == 'up':
+                self.y -= step
             return
-        p = self.turn_path.sample(self.turn_progress)
-        self.x, self.y = p[0], p[1]
 
-        # rotate sprite to face heading
-        heading = self.turn_path.heading(self.turn_progress)
-        # pygame rotates counterclockwise, and our heading uses screen coords (y down),
-        # this works well enough for visual alignment.
-        self.image = pygame.transform.rotate(self.originalImage, heading)
+        if self.pending_kind == "path":
+            if self.turn_path is None:
+                return
+            self.turn_progress += self.pending_amount * fraction
+            if self.turn_progress >= self.turn_path.length:
+                end = self.turn_path.sample(self.turn_path.length)
+                self.x, self.y = end[0], end[1]
+                self.in_turn_path = False
+                self.turn_path = None
+                self.image = self.originalImage
+                return
+            pos = self.turn_path.sample(self.turn_progress)
+            self.x, self.y = pos[0], pos[1]
+            heading = self.turn_path.heading(self.turn_progress)
+            self.image = pygame.transform.rotate(self.originalImage, heading)
+            return
 
-    def update(self, dt: float, now_s: float):
-        self.mover.step(self, dt)
+    def post_motion(self, now_s: float):
+        # mark crossed for stats
         self._mark_crossed_if_needed(now_s)
 
         # cleanup if offscreen
-        if (self.x < -300) or (self.x > self.config.screenWidth + 300) or (self.y < -300) or (self.y > self.config.screenHeight + 300):
+        if (self.x < -400) or (self.x > self.config.screenWidth + 400) or (self.y < -400) or (self.y > self.config.screenHeight + 400):
+            self.alive = False
             self.world.unregister_vehicle(self)
 
     def render(self, screen: pygame.Surface):
         screen.blit(self.image, (self.x, self.y))
 
 # -----------------------------------------------------------------------------
-#  VehicleFactory (improvement #1 without dead code)
+#  VehicleFactory
 # -----------------------------------------------------------------------------
 
 class VehicleFactory:
@@ -740,7 +991,7 @@ class VehicleFactory:
         Vehicle(self.assets, self.world, vehicleClass, direction_number, direction, lane, will_turn)
 
 # -----------------------------------------------------------------------------
-#  Spawner with queue + optional generator thread (improvement #4, #7)
+#  Spawner with queue + spawn clearance
 # -----------------------------------------------------------------------------
 
 class SpawnRequest:
@@ -751,12 +1002,13 @@ class SpawnRequest:
         self.will_turn = will_turn
 
 class Spawner:
-    def __init__(self, config: SimulationConfig, world: WorldState, factory: VehicleFactory):
+    def __init__(self, config: SimulationConfig, world: WorldState, factory: VehicleFactory, assets: AssetManager):
         self.config = config
         self.world = world
         self.factory = factory
+        self.assets = assets
+
         self.spawn_queue: "queue.Queue[SpawnRequest]" = queue.Queue()
-        self._spawn_accum = 0.0
 
         self.allowedVehicleTypes = {'car': True, 'bus': True, 'truck': True, 'bike': True}
         self.allowedVehicleTypesList = []
@@ -766,7 +1018,6 @@ class Spawner:
                 self.allowedVehicleTypesList.append(i)
             i += 1
 
-        # Optional separate producer thread (kept minimal, safe via queue)
         self._producer_running = True
         self._producer_thread = threading.Thread(target=self._producer_loop, daemon=True)
         self._producer_thread.start()
@@ -775,7 +1026,6 @@ class Spawner:
         self._producer_running = False
 
     def _producer_loop(self):
-        # produces at approximate interval; actual spawn happens in main thread
         while self._producer_running:
             req = self._make_request()
             self.spawn_queue.put(req)
@@ -809,13 +1059,12 @@ class Spawner:
         return SpawnRequest(vehicle_type_index, lane_number, direction_number, will_turn)
 
     def _spawn_area_clear(self, direction: str, lane: int, vehicle_img: pygame.Surface) -> bool:
-        # checks if any vehicle overlaps a spawn "buffer" rectangle
         sx = self.config.spawnX[direction][lane]
         sy = self.config.spawnY[direction][lane]
         w = vehicle_img.get_rect().width
         h = vehicle_img.get_rect().height
 
-        buffer = self.config.stoppingGap + 10
+        buffer = self.config.stoppingGap + 20
         spawn_rect = pygame.Rect(sx - buffer, sy - buffer, w + 2*buffer, h + 2*buffer)
 
         for v in self.world.lane_list(direction, lane):
@@ -823,8 +1072,7 @@ class Spawner:
                 return False
         return True
 
-    def consume_and_spawn(self, assets: AssetManager, max_per_tick: int = 3):
-        # consume up to N requests per frame; spawn if safe, else drop (or requeue lightly)
+    def consume_and_spawn(self, max_per_tick: int = 3):
         count = 0
         while count < max_per_tick:
             try:
@@ -835,19 +1083,19 @@ class Spawner:
             direction = self.world.directionNumbers[req.direction_number]
             vehicleClass = self.factory.vehicleTypesByIndex[req.vehicle_type_index]
             img_path = self.config.vehicleImageTemplate.format(direction=direction, vehicleClass=vehicleClass)
-            img = assets.image(img_path)
+            img = self.assets.image(img_path)
 
             if self._spawn_area_clear(direction, req.lane, img):
                 self.factory.create(req.vehicle_type_index, req.lane, req.direction_number, req.will_turn)
             else:
-                # requeue once with a short delay probability to avoid permanent drop bursts
-                if random.random() < 0.25:
+                # keep trying later to avoid "burst overlap" under heavy queue
+                if random.random() < 0.50:
                     self.spawn_queue.put(req)
 
             count += 1
 
 # -----------------------------------------------------------------------------
-#  Simulation Engine (improvement #6, #8, #9, #10)
+#  Simulation Engine
 # -----------------------------------------------------------------------------
 
 class SimulationEngine:
@@ -873,38 +1121,34 @@ class SimulationEngine:
         self.signalController = SignalController(self.config)
         self.world = WorldState(self.config, self.signalController)
         self.factory = VehicleFactory(self.assets, self.world)
-        self.spawner = Spawner(self.config, self.world, self.factory)
+        self.spawner = Spawner(self.config, self.world, self.factory, self.assets)
+
+        self.collisionManager = CollisionManager(self.world)
 
         self.running = True
         self.paused = False
-        self.start_time_real = time.time()
         self.sim_time = 0.0
 
         self._last_stats_sample = 0.0
-
-        # overlay toggles
         self.show_overlay = True
 
     def reset(self):
         logging.info("Resetting simulation...")
-        # stop spawner producer cleanly
         self.spawner.stop()
 
-        # rebuild everything with current config
         self.signalController = SignalController(self.config)
         self.world = WorldState(self.config, self.signalController)
         self.factory = VehicleFactory(self.assets, self.world)
-        self.spawner = Spawner(self.config, self.world, self.factory)
+        self.spawner = Spawner(self.config, self.world, self.factory, self.assets)
+        self.collisionManager = CollisionManager(self.world)
 
         self.sim_time = 0.0
-        self.start_time_real = time.time()
         self.paused = False
 
     def reload_config(self):
         logging.info("Reloading config from config.json...")
         self.config = load_config_from_file("config.json", self.config)
 
-        # refresh dependent objects
         self.assets = AssetManager(self.config)
         self.assets.validate_or_die(required_vehicle_types=['car','bus','truck','bike'], directions=['right','down','left','up'])
 
@@ -913,11 +1157,9 @@ class SimulationEngine:
         self.yellowSignal = self.assets.image(self.config.yellowSignalPath)
         self.greenSignal = self.assets.image(self.config.greenSignalPath)
 
-        # rebuild controller/world/spawner with new config
         self.reset()
 
     def _write_stats_csv(self):
-        # improvement #10: save summary + timeseries
         try:
             with open("stats.csv", "w", encoding="utf-8") as f:
                 f.write("metric,value\n")
@@ -926,13 +1168,10 @@ class SimulationEngine:
                 f.write(f"time_seconds,{int(self.sim_time)}\n")
                 for d in ['right','down','left','up']:
                     f.write(f"crossed_{d},{self.world.crossed[d]}\n")
-
-                # avg queue lengths
                 for d in ['right','down','left','up']:
                     samples = self.world.queue_len_samples[d]
                     avgq = (sum(samples)/len(samples)) if samples else 0.0
                     f.write(f"avg_queue_{d},{avgq:.3f}\n")
-
             logging.info("Wrote stats.csv")
         except Exception as e:
             logging.error("Failed writing stats.csv: %s", str(e))
@@ -968,14 +1207,12 @@ class SimulationEngine:
             else:
                 self.screen.blit(self.redSignal, self.config.signalCoods[i])
 
-        # timers
         for i in range(4):
             text = self.signalController.display_value_for_signal(i)
             surf = self.font.render(text, True, (255,255,255), (0,0,0))
             self.screen.blit(surf, self.config.signalTimerCoods[i])
 
     def _draw_counts_and_time(self, fps: float):
-        # vehicle count per direction number order: right, down, left, up
         dirs = {0:'right', 1:'down', 2:'left', 3:'up'}
         for i in range(4):
             d = dirs[i]
@@ -993,6 +1230,7 @@ class SimulationEngine:
                 f"Total Passed: {total}",
                 f"SpawnQ: {self.spawner.spawn_queue.qsize()}",
                 f"Paused: {self.paused}",
+                f"IntersectionOwner: {self.world.intersection_owner_id}",
                 "Keys: SPACE pause | R reset | C reload config.json | O overlay | ESC quit",
             ]
             y = 10
@@ -1001,7 +1239,6 @@ class SimulationEngine:
                 self.screen.blit(s, (10, y))
                 y += 20
 
-            # throughput last 60s
             now_s = self.sim_time
             recent = [t for (t, _) in self.world.throughput_events if (now_s - t) <= 60.0]
             tpm = len(recent)
@@ -1019,18 +1256,16 @@ class SimulationEngine:
                 fps = self.clock.get_fps()
 
                 if not self.paused:
+                    # signals tick
                     self.sim_time += dt
                     self.signalController.tick(dt)
 
-                    # spawn safely in main thread (improvement #7) using queue (improvement #4)
-                    self.spawner.consume_and_spawn(self.assets, max_per_tick=3)
+                    # spawn vehicles (main thread only)
+                    self.spawner.consume_and_spawn(max_per_tick=3)
 
-                    # update vehicles (dt-based movement; improvement #6)
-                    now_s = self.sim_time
-                    for v in list(self.world.simulation):
-                        v.update(dt, now_s)
+                    # strong collision-aware update (replaces per-vehicle naive move)
+                    self.collisionManager.resolve_all(dt, self.sim_time)
 
-                    # sample queues for stats once per second (improvement #8 instrumentation)
                     if (self.sim_time - self._last_stats_sample) >= 1.0:
                         self.world.sample_queue_lengths()
                         self._last_stats_sample = self.sim_time
@@ -1039,16 +1274,21 @@ class SimulationEngine:
                         logging.info("Simulation time reached: %s seconds", self.config.simulationTime)
                         self.running = False
 
-                # render
                 self.screen.blit(self.background, (0, 0))
+
+                # draw intersection conflict rect in overlay mode (debug)
+                if self.show_overlay:
+                    pygame.draw.rect(self.screen, (255, 0, 0), self.world.intersection_rect, 2)
+
                 self._draw_signals()
+
                 for v in self.world.simulation:
                     v.render(self.screen)
+
                 self._draw_counts_and_time(fps)
                 pygame.display.update()
 
         finally:
-            # graceful shutdown
             self.spawner.stop()
             self._write_stats_csv()
             pygame.quit()
